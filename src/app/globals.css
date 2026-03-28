@@ -3,6 +3,14 @@
 :root {
   --background: #fafaf9;
   --foreground: #1c1917;
+  --muted: #78716c;
+  --border: #e7e5e4;
+  --card: #ffffff;
+  --accent-politics: #dc2626;
+  --accent-economy: #2563eb;
+  --accent-society: #d97706;
+  --accent-tech: #7c3aed;
+  --accent-culture: #059669;
 }
 
 @theme inline {
@@ -17,10 +25,27 @@
   :root {
     --background: #0c0a09;
     --foreground: #e7e5e4;
+    --muted: #a8a29e;
+    --border: #292524;
+    --card: #1c1917;
+    --accent-politics: #f87171;
+    --accent-economy: #60a5fa;
+    --accent-society: #fbbf24;
+    --accent-tech: #a78bfa;
+    --accent-culture: #34d399;
   }
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.5s ease-out both;
 }

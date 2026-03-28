@@ -65,7 +65,3 @@ src/lib/          Supabase 클라이언트, 쿼리, 타입
 supabase/         Edge Function (뉴스 수집 + 분석 + 요약)
 e2e/              Playwright E2E 테스트
 ```
-
-## 월 비용
-
-~$1 (Claude API 요약 1회/일)

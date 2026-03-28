@@ -46,31 +46,31 @@ export default async function DateDetailPage(props: {
   ]);
 
   return (
-    <main className="mx-auto w-full max-w-[640px] px-4 py-12">
+    <main className="mx-auto w-full max-w-[640px] px-5 py-16">
       <Link
         href="/archive"
-        className="text-sm text-stone-400 hover:text-stone-600 dark:text-stone-500 dark:hover:text-stone-300"
+        className="group flex items-center gap-2 text-sm text-[var(--muted)] transition-colors hover:text-stone-900 dark:hover:text-stone-100"
       >
-        &larr; 아카이브
+        <span className="transition-transform group-hover:-translate-x-1">
+          &larr;
+        </span>
+        아카이브
       </Link>
 
-      <div className="mt-4">
+      <div className="mt-6">
         <NewsletterHeader date={date} />
       </div>
 
       {topics.length === 0 ? (
-        <p className="py-20 text-center text-stone-400 dark:text-stone-500">
+        <p className="py-20 text-center text-[var(--muted)]">
           해당 날짜의 핫토픽이 없습니다.
         </p>
       ) : (
-        <div className="space-y-10">
+        <div className="space-y-12">
           {topics.map((topic, i) => (
             <div key={topic.id}>
               <TopicCard topic={topic} index={i} />
               <TopicJsonLd topic={topic} date={date} />
-              {i < topics.length - 1 && (
-                <hr className="mt-10 border-stone-200 dark:border-stone-800" />
-              )}
             </div>
           ))}
         </div>

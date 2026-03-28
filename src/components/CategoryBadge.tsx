@@ -1,14 +1,12 @@
-import { categoryStyles } from "@/lib/types";
+import { getCategoryStyle } from "@/lib/types";
 
 export function CategoryBadge({ category }: { category: string }) {
-  const style =
-    categoryStyles[category] ??
-    "bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-300";
+  const { badge } = getCategoryStyle(category);
 
   return (
     <span
       data-testid="category-badge"
-      className={`inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ${style}`}
+      className={`inline-block rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider ${badge}`}
     >
       {category}
     </span>
