@@ -4,7 +4,7 @@
 
 ## 1. 프로젝트 개요
 
-매일 아침 AI가 한국 뉴스 + 글로벌 IT/테크 핫토픽 5개를 선정하고, 관련 기사를 수집·요약(한국어)하여 뉴스레터 스타일 블로그에 게시하는 서비스.
+매일 아침 네이버 뉴스 API로 최신 뉴스 1000건을 수집하고, 키워드 빈도 분석으로 핫토픽 10개 후보를 자동 추출한 뒤, Claude가 5개를 선정·요약(한국어)하여 뉴스레터 스타일 블로그에 게시하는 서비스.
 
 ---
 
@@ -15,9 +15,12 @@
 | 프레임워크 | Next.js 16.2.1 (App Router) | 순수 프론트엔드, API Route 없음 |
 | 런타임 | React 19.2.4 | |
 | 스타일링 | Tailwind CSS 4.x | |
+| 폰트 | Noto Serif KR (본문), Geist Sans (UI), Geist Mono | next/font/google |
 | DB | Supabase PostgreSQL | 기존 프로젝트 사용, Supabase MCP로 조작 |
+| 뉴스 수집 | Naver News Search API | 1000건 수집 (10회 API 호출) |
+| 핫토픽 추출 | 키워드 빈도 분석 (topics.ts) | 순수 코드, AI 없음 |
+| AI 요약 | Claude API (Sonnet) — 요약 전용 | 1회 호출, ~2000 토큰 |
 | AI 파이프라인 | Supabase Edge Function (Deno) | 최대 400초 타임아웃 |
-| AI | Claude API (Sonnet) | web_search 포함, fetch 직접 호출 (SDK 없음) |
 | 스케줄러 | Supabase pg_cron + pg_net | Edge Function 직접 트리거 |
 | 검증 | Zod | Claude 응답 파싱 (Edge Function 내) |
 | E2E 테스트 | Playwright | Playwright MCP로 실행 |
@@ -35,11 +38,11 @@
        │  pg_net.http_post()
        ▼
 [Supabase Edge Function: generate-topics]
-  │  1. 전일 토픽 조회 (중복 방지)
-  │  2. Claude API + web_search → 토픽 5개 선정
-  │  3. Zod 검증 & 재시도 (최대 3회)
-  │  4. Claude API + web_search → 토픽별 상세 요약
-  │  5. DB 저장 (upsert)
+  │  1. Naver News API → 최신 뉴스 1000건 수집
+  │  2. 키워드 빈도 분석 → 핫토픽 10개 후보 추출
+  │  3. Claude API → 5개 선정 + 요약 (1회 호출)
+  │  4. Zod 검증 & 재시도 (최대 3회)
+  │  5. DB 저장 (delete + insert)
   │  6. pipeline_logs 기록
        │
        ▼
@@ -47,9 +50,9 @@
        │
        ▼
 [Next.js on Vercel]  ← DB 읽기만, 순수 프론트엔드
-  /                 오늘의 핫토픽 (ISR)
-  /archive          날짜별 아카이브 (ISR)
-  /archive/[date]   특정 날짜 상세 (ISR)
+  /                 오늘의 핫토픽 (ISR 1일)
+  /archive          날짜별 아카이브 (ISR 1일)
+  /archive/[date]   특정 날짜 상세 (ISR 1일)
   /og               OG 이미지 자동 생성
   /sitemap.xml      사이트맵 자동 생성
 ```
@@ -119,19 +122,7 @@ CREATE POLICY "Service role only"
   WITH CHECK (auth.role() = 'service_role');
 ```
 
-### 4-3. 유틸리티 함수
-
-```sql
--- 전일 토픽 제목 조회 (중복 방지용)
-CREATE OR REPLACE FUNCTION get_yesterday_titles()
-RETURNS TEXT[] AS $$
-  SELECT COALESCE(array_agg(title), '{}'::TEXT[])
-  FROM daily_topics
-  WHERE date = CURRENT_DATE - 1;
-$$ LANGUAGE sql STABLE;
-```
-
-### 4-4. pg_cron 스케줄 등록
+### 4-3. pg_cron 스케줄 등록
 
 Supabase 대시보드 > SQL Editor에서 실행한다. pg_cron과 pg_net 확장이 활성화되어 있어야 한다.
 
@@ -188,12 +179,13 @@ SELECT net.http_post(
 supabase/
 └── functions/
     └── generate-topics/
-        ├── index.ts           # 엔트리포인트
-        ├── claude.ts          # Claude API 호출 (fetch)
-        ├── prompts.ts         # 프롬프트 템플릿
+        ├── index.ts           # 엔트리포인트 (인증 + 요청 처리)
+        ├── naver.ts           # Naver News API 호출 (1000건 수집)
+        ├── topics.ts          # 키워드 빈도 분석 (핫토픽 추출)
+        ├── claude.ts          # Claude API 호출 (요약 전용, fetch)
+        ├── prompts.ts         # 프롬프트 템플릿 (영어)
         ├── schemas.ts         # Zod 검증 스키마
-        ├── pipeline.ts        # 파이프라인 오케스트레이터
-        └── retry.ts           # 재시도 로직
+        └── pipeline.ts        # 파이프라인 오케스트레이터 + 재시도 로직
 ```
 
 ### 5-2. 엔트리포인트 (`index.ts`)
@@ -204,7 +196,6 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js";
 import { runPipeline } from "./pipeline.ts";
 
 serve(async (req: Request) => {
-  // 인증: service_role key 확인
   const authHeader = req.headers.get("Authorization");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
@@ -226,9 +217,159 @@ serve(async (req: Request) => {
 });
 ```
 
-### 5-3. Claude API 호출 (`claude.ts`)
+### 5-3. Naver News API (`naver.ts`)
 
-SDK 없이 fetch로 직접 호출한다.
+네이버 뉴스 검색 API로 최신 뉴스 1000건을 수집한다. 10회 호출(100건 x 10페이지).
+
+```typescript
+interface NaverNewsItem {
+  title: string;
+  link: string;
+  description: string;
+  pubDate: string;
+}
+
+export async function fetchNaverNews(): Promise<NaverNewsItem[]> {
+  const clientId = Deno.env.get("NAVER_CLIENT_ID");
+  const clientSecret = Deno.env.get("NAVER_CLIENT_SECRET");
+  const allItems: NaverNewsItem[] = [];
+
+  // 1000건 수집 (10회 호출)
+  for (let page = 0; page < 10; page++) {
+    const start = page * 100 + 1;
+    const url = `https://openapi.naver.com/v1/search/news.json?query=${encodeURIComponent("뉴스")}&display=100&start=${start}&sort=date`;
+
+    const response = await fetch(url, {
+      headers: {
+        "X-Naver-Client-Id": clientId!,
+        "X-Naver-Client-Secret": clientSecret!,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Naver API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    for (const item of data.items) {
+      allItems.push({
+        title: cleanHtml(item.title),
+        link: item.link,
+        description: cleanHtml(item.description),
+        pubDate: item.pubDate,
+      });
+    }
+  }
+
+  return allItems;
+}
+
+function cleanHtml(text: string): string {
+  return text
+    .replace(/<[^>]*>/g, "")
+    .replace(/&quot;/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+```
+
+### 5-4. 키워드 빈도 분석 (`topics.ts`)
+
+순수 코드로 뉴스 제목에서 2-키워드 조합의 빈도를 계산하여 핫토픽을 추출한다. AI 호출 없음.
+
+```typescript
+interface NewsItem {
+  title: string;
+  link: string;
+  description: string;
+  pubDate: string;
+}
+
+export interface HotTopic {
+  keywords: string[];
+  count: number;
+  articles: NewsItem[];
+}
+
+const STOPWORDS = new Set([
+  "뉴스", "오늘", "기자", "제공", "관련", "대한", "이번", "통해", "위해",
+  "것으로", "으로", "에서", "대해", "한다", "있다", "했다", "된다", "하는", "있는",
+  "라며", "이라고", "인사", "포토", "사진", "영상", "속보", "종합", "단독", "업데이트",
+  "quot", "amp",
+  "연합뉴스", "헤럴드경제", "한겨레", "한국경제", "매일경제", "조선일보", "중앙일보",
+  "서울", "부산", "대전", "대구", "광주", "제주", "경기", "전국", "지역",
+  "대표", "위원", "의원", "장관", "시장", "전면", "이상", "이후", "이전", "올해",
+  "지난해", "현재", "내년", "최근", "이날",
+]);
+
+export function extractHotTopics(
+  newsItems: NewsItem[],
+  topicCount = 10,
+): HotTopic[] {
+  // 각 기사에서 키워드 추출
+  const articleKeywords: string[][] = newsItems.map((item) => {
+    const words = item.title.match(/[가-힣A-Za-z0-9]{2,}/g) ?? [];
+    return [...new Set(words.filter((w) => !STOPWORDS.has(w)))];
+  });
+
+  // 2-키워드 조합 빈도 계산
+  const pairCounts = new Map<string, number>();
+  const pairArticles = new Map<string, number[]>();
+
+  for (let i = 0; i < articleKeywords.length; i++) {
+    const words = articleKeywords[i];
+    for (let a = 0; a < words.length; a++) {
+      for (let b = a + 1; b < words.length; b++) {
+        const pair = [words[a], words[b]].sort().join("|");
+        pairCounts.set(pair, (pairCounts.get(pair) ?? 0) + 1);
+        if (!pairArticles.has(pair)) pairArticles.set(pair, []);
+        pairArticles.get(pair)!.push(i);
+      }
+    }
+  }
+
+  // 빈도순 정렬
+  const sorted = [...pairCounts.entries()].sort((a, b) => b[1] - a[1]);
+
+  // 핫토픽 추출 (키워드 겹침 방지)
+  const usedIndices = new Set<number>();
+  const usedKeywords = new Set<string>();
+  const topics: HotTopic[] = [];
+
+  for (const [pair, count] of sorted) {
+    if (topics.length >= topicCount) break;
+
+    const [kw1, kw2] = pair.split("|");
+    if (usedKeywords.has(kw1) || usedKeywords.has(kw2)) continue;
+
+    const indices = pairArticles
+      .get(pair)!
+      .filter((i) => !usedIndices.has(i));
+
+    if (indices.length >= 3) {
+      const articles = indices.slice(0, 5).map((i) => newsItems[i]);
+      for (const i of indices) usedIndices.add(i);
+      usedKeywords.add(kw1);
+      usedKeywords.add(kw2);
+      topics.push({ keywords: [kw1, kw2], count, articles });
+    }
+  }
+
+  return topics;
+}
+```
+
+**알고리즘 요약**:
+1. 각 기사 제목에서 한글/영문 2글자 이상 단어를 추출하고 불용어를 제거
+2. 기사 내 2-키워드 조합(pair)의 출현 빈도를 계산
+3. 빈도순으로 정렬하되, 이미 사용된 키워드는 건너뜀 (중복 방지)
+4. 최소 3개 기사에 등장하는 조합만 채택, 관련 기사 최대 5개 첨부
+
+### 5-5. Claude API 호출 (`claude.ts`)
+
+SDK 없이 fetch로 직접 호출한다. **요약 전용** — web_search 도구 없음.
 
 ```typescript
 interface ClaudeMessage {
@@ -242,7 +383,7 @@ interface ClaudeCallOptions {
   maxTokens?: number;
 }
 
-async function callClaude(options: ClaudeCallOptions): Promise<string> {
+export async function callClaude(options: ClaudeCallOptions): Promise<string> {
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -257,12 +398,6 @@ async function callClaude(options: ClaudeCallOptions): Promise<string> {
       max_tokens: options.maxTokens ?? 4096,
       system: options.system,
       messages: options.messages,
-      tools: [
-        {
-          type: "web_search_20250305",
-          name: "web_search",
-        },
-      ],
     }),
   });
 
@@ -273,7 +408,7 @@ async function callClaude(options: ClaudeCallOptions): Promise<string> {
 
   const data = await response.json();
 
-  // text 블록만 추출하여 결합
+  // deno-lint-ignore no-explicit-any
   const text = data.content
     .filter((block: any) => block.type === "text")
     .map((block: any) => block.text)
@@ -283,92 +418,59 @@ async function callClaude(options: ClaudeCallOptions): Promise<string> {
 }
 ```
 
-### 5-4. 프롬프트 설계 (`prompts.ts`)
+### 5-6. 프롬프트 설계 (`prompts.ts`)
 
-**1차: 토픽 선정**
+**단일 프롬프트**: 10개 후보에서 5개 선정 + 요약을 한 번에 처리. 프롬프트는 영어, 응답은 한국어.
 
 ```typescript
-function buildTopicSelectionPrompt(
+import type { HotTopic } from "./topics.ts";
+
+export function buildSummaryPrompt(
   today: string,
-  yesterdayTitles: string[],
+  hotTopics: HotTopic[],
 ): { system: string; user: string } {
-  const excludeSection = yesterdayTitles.length > 0
-    ? `\n## 제외 토픽 (어제 다룬 주제)\n${yesterdayTitles.map((t) => `- ${t}`).join("\n")}`
-    : "";
+  const topicList = hotTopics
+    .map((t, i) => {
+      const articles = t.articles
+        .map((a) => `  - ${a.title}\n    ${a.description}\n    ${a.link}`)
+        .join("\n");
+      return `Candidate ${i + 1}: [${t.keywords.join(" + ")}] (${t.count} articles)\n${articles}`;
+    })
+    .join("\n\n");
 
   return {
-    system: "당신은 한국 뉴스 및 글로벌 IT/테크 트렌드 큐레이터입니다. 반드시 JSON만 응답하세요.",
-    user: `오늘은 ${today}입니다.
+    system: "You are a news briefing writer. Respond ONLY with valid JSON.",
+    user: `Today: ${today}
 
-## 작업
-어제부터 오늘 아침까지 가장 화제가 된 뉴스 토픽 5개를 선정하세요.
+## 10 Hot Topic Candidates (sorted by frequency from 1000 news articles)
+${topicList}
 
-## 토픽 범위
-- 한국 뉴스: 정치, 경제, 사회 등 (네이버 뉴스, 다음 뉴스, 구글 트렌드 한국 교차 확인)
-- 글로벌 IT/테크: 해외 기술 뉴스, AI, 스타트업 등
+## Selection Rules
+- Pick exactly 5 from the 10 candidates above
+- Assign category: 정치, 경제, 사회, IT·테크, or 문화·스포츠
+- Max 2 topics per category (ensure diversity)
+- Prioritize higher frequency candidates
 
-## 선정 기준
-- 한국 뉴스 3~4개 + 글로벌 IT/테크 1~2개 (유동적으로 배분)
-- 같은 사건의 다른 기사는 하나로 통합
-- 제외: 연예인 사생활, 단순 광고성 콘텐츠
-${excludeSection}
+## For each selected topic, write:
+- title: Korean title (max 15 chars, descriptive)
+- category: one of the categories above
+- summary: Korean summary, 3-5 sentences (200-400 chars), objective tone, based on the article descriptions
+- keywords: 2-3 Korean keywords
+- sources: use the URLs from above (3-4 per topic)
 
-## 응답 형식 (JSON만, 다른 텍스트 없이)
-{
-  "topics": [
-    {
-      "title": "토픽 제목 (15자 이내)",
-      "category": "카테고리명",
-      "keywords": ["키워드1", "키워드2", "키워드3"]
-    }
-  ]
-}`,
+## JSON format
+{"articles":[{"title":"제목","category":"카테고리","summary":"한국어 요약","keywords":["k1","k2"],"sources":[{"title":"기사제목","url":"https://..."}]}]}`,
   };
 }
 ```
 
-**2차: 상세 요약**
+**이전 버전과의 차이점**:
+- 2단계(토픽 선정 → 요약)에서 **1단계로 통합** (Claude 1회 호출)
+- web_search 제거 — 뉴스 수집은 Naver API가 담당
+- 프롬프트가 영어 (토큰 절약), 응답만 한국어
+- 전일 토픽 제외 로직 제거 (키워드 빈도 분석이 자연스럽게 당일 뉴스에 집중)
 
-```typescript
-function buildSummaryPrompt(
-  today: string,
-  topics: Topic[],
-): { system: string; user: string } {
-  return {
-    system: "당신은 뉴스 브리핑 작성자입니다. 반드시 JSON만 응답하세요.",
-    user: `오늘은 ${today}입니다.
-
-## 작업
-아래 토픽들에 대해 각각 관련 기사를 웹 검색하여 한국어로 요약하세요.
-
-## 토픽 목록
-${JSON.stringify(topics, null, 2)}
-
-## 요약 규칙
-- 토픽당 3~5문장 (200~400자)
-- 객관적 뉴스 브리핑 어조
-- 핵심 수치, 인용이 있으면 포함
-- 관련 기사 출처 URL을 최소 2개 포함 (실제 접근 가능한 URL만)
-
-## 응답 형식 (JSON만, 다른 텍스트 없이)
-{
-  "articles": [
-    {
-      "title": "토픽 제목",
-      "category": "카테고리",
-      "summary": "한국어 요약 내용",
-      "keywords": ["키워드1", "키워드2"],
-      "sources": [
-        { "title": "기사 제목", "url": "https://..." }
-      ]
-    }
-  ]
-}`,
-  };
-}
-```
-
-### 5-5. Zod 검증 스키마 (`schemas.ts`)
+### 5-7. Zod 검증 스키마 (`schemas.ts`)
 
 ```typescript
 import { z } from "https://esm.sh/zod";
@@ -408,17 +510,17 @@ export function parseClaudeJSON<T>(raw: string, schema: z.ZodType<T>): T {
 }
 ```
 
-### 5-6. 파이프라인 오케스트레이터 (`pipeline.ts`)
+### 5-8. 파이프라인 오케스트레이터 (`pipeline.ts`)
+
+재시도 로직을 포함한 전체 파이프라인. 별도 `retry.ts` 없이 `pipeline.ts`에서 직접 처리.
 
 ```typescript
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js";
 import { callClaude } from "./claude.ts";
-import { buildTopicSelectionPrompt, buildSummaryPrompt } from "./prompts.ts";
-import {
-  parseClaudeJSON,
-  TopicSelectionResponse,
-  SummaryResponse,
-} from "./schemas.ts";
+import { fetchNaverNews } from "./naver.ts";
+import { extractHotTopics } from "./topics.ts";
+import { buildSummaryPrompt } from "./prompts.ts";
+import { parseClaudeJSON, SummaryResponse } from "./schemas.ts";
 
 interface PipelineResult {
   status: "success" | "partial" | "failed";
@@ -432,53 +534,61 @@ export async function runPipeline(
   supabase: SupabaseClient,
 ): Promise<PipelineResult> {
   const startTime = Date.now();
-  const today = new Date().toISOString().split("T")[0];
+  const today = new Date(Date.now() + 9 * 3600 * 1000)
+    .toISOString()
+    .split("T")[0];
   let retryCount = 0;
 
   try {
-    // 1. 전일 토픽 조회
-    const { data: yesterdayData } = await supabase.rpc("get_yesterday_titles");
-    const yesterdayTitles: string[] = yesterdayData ?? [];
+    // 1. 네이버 뉴스 1000건 수집
+    const newsItems = await fetchNaverNews();
 
-    // 2. 토픽 선정 (최대 3회 재시도)
-    let topics = [];
-    while (retryCount <= 3 && topics.length < 5) {
-      const prompt = buildTopicSelectionPrompt(today, yesterdayTitles);
+    // 2. 키워드 빈도 분석으로 핫토픽 10개 후보 추출
+    const hotTopics = extractHotTopics(newsItems, 10);
+
+    if (hotTopics.length === 0) {
+      await logPipeline(supabase, {
+        date: today, status: "failed", topicsCount: 0,
+        retryCount: 0, durationMs: Date.now() - startTime,
+        error: "No hot topics found from news",
+      });
+      return {
+        status: "failed", topicsCount: 0, retryCount: 0,
+        durationMs: Date.now() - startTime,
+        error: "No hot topics found from news",
+      };
+    }
+
+    // 3. Claude로 5개 선정 + 요약 생성 (최대 3회 재시도)
+    let articles;
+    while (retryCount <= 3) {
+      const prompt = buildSummaryPrompt(today, hotTopics);
       const raw = await callClaude({
         system: prompt.system,
         messages: [{ role: "user", content: prompt.user }],
       });
 
       try {
-        const result = parseClaudeJSON(raw, TopicSelectionResponse);
-        topics = result.topics;
+        const result = parseClaudeJSON(raw, SummaryResponse);
+        articles = result.articles;
+        break;
       } catch {
         retryCount++;
-        continue;
       }
-
-      if (topics.length < 5) retryCount++;
     }
 
-    if (topics.length === 0) {
+    if (!articles || articles.length === 0) {
       await logPipeline(supabase, {
         date: today, status: "failed", topicsCount: 0,
         retryCount, durationMs: Date.now() - startTime,
-        error: "토픽 선정 실패",
+        error: "Summary generation failed",
       });
       return {
         status: "failed", topicsCount: 0, retryCount,
-        durationMs: Date.now() - startTime, error: "토픽 선정 실패",
+        durationMs: Date.now() - startTime,
+        error: "Summary generation failed",
       };
     }
-
-    // 3. 상세 요약 생성
-    const summaryPrompt = buildSummaryPrompt(today, topics);
-    const summaryRaw = await callClaude({
-      system: summaryPrompt.system,
-      messages: [{ role: "user", content: summaryPrompt.user }],
-    });
-    const { articles } = parseClaudeJSON(summaryRaw, SummaryResponse);
 
     // 4. DB 저장 (기존 데이터 삭제 후 삽입)
     await supabase.from("daily_topics").delete().eq("date", today);
@@ -517,32 +627,39 @@ export async function runPipeline(
   }
 }
 
-async function logPipeline(supabase: SupabaseClient, log: {
-  date: string; status: string; topicsCount: number;
-  retryCount: number; durationMs: number; error?: string;
-}) {
+async function logPipeline(
+  supabase: SupabaseClient,
+  log: {
+    date: string; status: string; topicsCount: number;
+    retryCount: number; durationMs: number; error?: string;
+  },
+) {
   await supabase.from("pipeline_logs").insert({
-    date: log.date,
-    status: log.status,
-    topics_count: log.topicsCount,
-    retry_count: log.retryCount,
-    duration_ms: log.durationMs,
-    error_message: log.error ?? null,
+    date: log.date, status: log.status,
+    topics_count: log.topicsCount, retry_count: log.retryCount,
+    duration_ms: log.durationMs, error_message: log.error ?? null,
   });
 }
 ```
 
-### 5-7. Edge Function 환경변수
+**파이프라인 흐름 요약**:
+```
+Naver API 1000건 → 키워드 빈도 분석 → 10개 후보 → Claude가 5개 선정(카테고리별 최대 2개) + 요약 → DB 저장
+```
+
+### 5-9. Edge Function 환경변수
 
 Supabase 대시보드 > Edge Functions > Secrets에서 설정한다.
 
 | 변수명 | 용도 |
 |---|---|
 | `ANTHROPIC_API_KEY` | Claude API 인증 |
+| `NAVER_CLIENT_ID` | Naver 뉴스 검색 API 클라이언트 ID |
+| `NAVER_CLIENT_SECRET` | Naver 뉴스 검색 API 클라이언트 시크릿 |
 
 > `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`는 Edge Function 내에서 자동으로 사용 가능하다.
 
-### 5-8. 배포
+### 5-10. 배포
 
 ```bash
 # Supabase CLI로 Edge Function 배포
@@ -556,101 +673,184 @@ supabase functions deploy generate-topics
 ### 6-1. 프로젝트 구조
 
 ```
-app/
-├── layout.tsx                    # 루트 레이아웃 + 전역 메타데이터
-├── page.tsx                      # 메인: 오늘의 핫토픽
-├── archive/
-│   ├── page.tsx                  # 아카이브 목록
-│   └── [date]/
-│       └── page.tsx              # 특정 날짜 상세
-├── og/
-│   └── route.tsx                 # OG 이미지 동적 생성 (ImageResponse)
-└── sitemap.ts                    # sitemap.xml 자동 생성
-
-lib/
-├── supabase.ts                   # Supabase 클라이언트 (anon key, 읽기 전용)
-├── queries.ts                    # 데이터 조회 함수
-└── types.ts                      # 공유 타입 정의
-
-components/
-├── TopicCard.tsx                 # 토픽 카드
-├── CategoryBadge.tsx             # 카테고리 태그
-├── SourceLinks.tsx               # 출처 링크 목록
-├── DateNav.tsx                   # 날짜 네비게이션
-├── NewsletterHeader.tsx          # 뉴스레터 스타일 헤더
-└── TopicSkeleton.tsx             # 로딩 스켈레톤
+src/
+├── app/
+│   ├── layout.tsx                    # 루트 레이아웃 + 전역 메타데이터 + 폰트
+│   ├── page.tsx                      # 메인: 오늘의 핫토픽
+│   ├── loading.tsx                   # 메인 로딩 스켈레톤
+│   ├── globals.css                   # Tailwind + CSS 변수 (라이트/다크)
+│   ├── archive/
+│   │   ├── page.tsx                  # 아카이브 목록
+│   │   └── [date]/
+│   │       ├── page.tsx              # 특정 날짜 상세
+│   │       └── loading.tsx           # 상세 로딩 스켈레톤
+│   ├── og/
+│   │   └── route.tsx                 # OG 이미지 동적 생성 (ImageResponse)
+│   └── sitemap.ts                    # sitemap.xml 자동 생성
+├── lib/
+│   ├── supabase.ts                   # Supabase 클라이언트 (anon key, 읽기 전용)
+│   ├── queries.ts                    # 데이터 조회 함수 + formatDateKR
+│   └── types.ts                      # 공유 타입 정의 + 카테고리 스타일
+└── components/
+    ├── TopicCard.tsx                 # 토픽 카드
+    ├── CategoryBadge.tsx             # 카테고리 태그
+    ├── SourceLinks.tsx               # 출처 링크 목록
+    ├── DateNav.tsx                   # 날짜 네비게이션
+    ├── NewsletterHeader.tsx          # 뉴스레터 스타일 헤더
+    ├── TopicSkeleton.tsx             # 로딩 스켈레톤
+    └── JsonLd.tsx                    # JSON-LD 구조화 데이터
 ```
 
-### 6-2. Supabase 클라이언트 (`lib/supabase.ts`)
+### 6-2. Supabase 클라이언트 (`src/lib/supabase.ts`)
 
 ```typescript
 import { createClient } from "@supabase/supabase-js";
 
-export const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-);
+const supabaseUrl =
+  process.env.NEXT_PUBLIC_SUPABASE_URL ?? "https://placeholder.supabase.co";
+const supabaseAnonKey =
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "placeholder";
+
+if (!process.env.NEXT_PUBLIC_SUPABASE_URL) {
+  console.warn("[supabase] NEXT_PUBLIC_SUPABASE_URL is not set");
+}
+if (!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
+  console.warn("[supabase] NEXT_PUBLIC_SUPABASE_ANON_KEY is not set");
+}
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 ```
 
-### 6-3. 데이터 조회 (`lib/queries.ts`)
+### 6-3. 데이터 조회 (`src/lib/queries.ts`)
 
 ```typescript
 import { supabase } from "./supabase";
+import type { DailyTopic } from "./types";
 
-// 특정 날짜 토픽 조회
-export async function getTopicsByDate(date: string) {
-  const { data, error } = await supabase
-    .from("daily_topics")
-    .select("*")
-    .eq("date", date)
-    .order("topic_order", { ascending: true });
+export async function getTopicsByDate(date: string): Promise<DailyTopic[]> {
+  try {
+    const { data, error } = await supabase
+      .from("daily_topics")
+      .select("*")
+      .eq("date", date)
+      .order("topic_order", { ascending: true });
 
-  if (error) throw error;
-  return data;
+    if (error) throw error;
+    return data ?? [];
+  } catch (error) {
+    console.error("[getTopicsByDate] Failed:", error);
+    return [];
+  }
 }
 
-// 가장 최근 날짜 토픽 조회 (메인 페이지용)
-export async function getLatestTopics() {
-  const { data } = await supabase
-    .from("daily_topics")
-    .select("date")
-    .order("date", { ascending: false })
-    .limit(1)
-    .single();
+export async function getLatestTopics(): Promise<{
+  topics: DailyTopic[];
+  date: string | null;
+}> {
+  try {
+    const { data } = await supabase
+      .from("daily_topics")
+      .select("date")
+      .order("date", { ascending: false })
+      .limit(1)
+      .single();
 
-  if (!data) return { topics: [], date: null };
+    if (!data) return { topics: [], date: null };
 
-  const topics = await getTopicsByDate(data.date);
-  return { topics, date: data.date };
+    const topics = await getTopicsByDate(data.date);
+    return { topics, date: data.date };
+  } catch (error) {
+    console.error("[getLatestTopics] Failed:", error);
+    return { topics: [], date: null };
+  }
 }
 
-// 아카이브: 토픽이 존재하는 날짜 목록
-export async function getArchiveDates(page = 1, perPage = 20) {
-  const { data, error } = await supabase
-    .from("daily_topics")
-    .select("date")
-    .order("date", { ascending: false });
+export async function getArchiveDates(
+  page = 1,
+  perPage = 20,
+): Promise<{ dates: string[]; total: number }> {
+  try {
+    const { data, error } = await supabase
+      .from("daily_topics")
+      .select("date")
+      .order("date", { ascending: false });
 
-  if (error) throw error;
+    if (error) throw error;
 
-  // 중복 날짜 제거 후 페이지네이션
-  const uniqueDates = [...new Set(data.map((d) => d.date))];
-  const start = (page - 1) * perPage;
-  return {
-    dates: uniqueDates.slice(start, start + perPage),
-    total: uniqueDates.length,
-  };
+    const uniqueDates = [...new Set((data ?? []).map((d) => d.date))];
+    const start = (page - 1) * perPage;
+
+    return {
+      dates: uniqueDates.slice(start, start + perPage),
+      total: uniqueDates.length,
+    };
+  } catch (error) {
+    console.error("[getArchiveDates] Failed:", error);
+    return { dates: [], total: 0 };
+  }
+}
+
+export function formatDateKR(dateString: string): string {
+  const date = new Date(dateString + "T00:00:00+09:00");
+  return new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    weekday: "long",
+    timeZone: "Asia/Seoul",
+  }).format(date);
 }
 ```
 
-### 6-4. 페이지별 렌더링
-
-모든 페이지는 ISR로 동작한다.
-
-**메인 페이지 (`app/page.tsx`)**
+### 6-4. 타입 정의 (`src/lib/types.ts`)
 
 ```typescript
-export const revalidate = 3600; // 1시간마다 재검증
+export interface Source {
+  title: string;
+  url: string;
+}
+
+export interface DailyTopic {
+  id: string;
+  date: string;
+  topic_order: number;
+  title: string;
+  category: string;
+  summary: string;
+  keywords: string[];
+  sources: Source[];
+  created_at: string;
+}
+
+export type Category =
+  | "정치"
+  | "경제"
+  | "사회"
+  | "IT·과학"
+  | "IT·테크"
+  | "문화·스포츠";
+
+export const categoryStyles: Record<string, string> = {
+  정치: "bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300",
+  경제: "bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300",
+  사회: "bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300",
+  "IT·과학":
+    "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300",
+  "IT·테크":
+    "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300",
+  "문화·스포츠":
+    "bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300",
+};
+```
+
+### 6-5. 페이지별 렌더링
+
+모든 페이지는 ISR 1일(86400초)로 동작한다.
+
+**메인 페이지 (`src/app/page.tsx`)**
+
+```typescript
+export const revalidate = 86400; // 1일마다 재검증
 
 export default async function Home() {
   const { topics, date } = await getLatestTopics();
@@ -658,24 +858,26 @@ export default async function Home() {
 }
 ```
 
-**아카이브 목록 (`app/archive/page.tsx`)**
+**아카이브 목록 (`src/app/archive/page.tsx`)**
 
 ```typescript
-export const revalidate = 86400; // 24시간
+export const revalidate = 86400; // 1일
 
-export default async function Archive() {
+export default async function ArchivePage() {
   const { dates } = await getArchiveDates();
   // 날짜 목록 렌더링
 }
 ```
 
-**날짜별 상세 (`app/archive/[date]/page.tsx`)**
+**날짜별 상세 (`src/app/archive/[date]/page.tsx`)**
 
 ```typescript
-export const revalidate = 86400; // 24시간
+export const revalidate = 86400; // 1일
 
-export default async function DateDetail({ params }) {
-  const { date } = await params;
+export default async function DateDetailPage(props: {
+  params: Promise<{ date: string }>;
+}) {
+  const { date } = await props.params;
   const topics = await getTopicsByDate(date);
   // 해당 날짜 토픽 렌더링
 }
@@ -688,7 +890,7 @@ export default async function DateDetail({ params }) {
 ### 7-1. 메타태그 + 동적 메타데이터
 
 ```typescript
-// app/layout.tsx
+// src/app/layout.tsx
 export const metadata: Metadata = {
   title: {
     default: "오늘의 핫토픽 — AI 뉴스 브리핑",
@@ -705,9 +907,11 @@ export const metadata: Metadata = {
 ```
 
 ```typescript
-// app/archive/[date]/page.tsx
-export async function generateMetadata({ params }): Promise<Metadata> {
-  const { date } = await params;
+// src/app/archive/[date]/page.tsx
+export async function generateMetadata(props: {
+  params: Promise<{ date: string }>;
+}): Promise<Metadata> {
+  const { date } = await props.params;
   const topics = await getTopicsByDate(date);
   const topicTitles = topics.map((t) => t.title).join(", ");
 
@@ -723,13 +927,13 @@ export async function generateMetadata({ params }): Promise<Metadata> {
 }
 ```
 
-### 7-2. OG 이미지 자동 생성 (`app/og/route.tsx`)
+### 7-2. OG 이미지 자동 생성 (`src/app/og/route.tsx`)
 
-Next.js의 `ImageResponse`를 사용하여 날짜별 OG 이미지를 동적으로 생성한다.
+Next.js의 `ImageResponse`를 사용하여 날짜별 OG 이미지를 동적으로 생성한다. CDN에서 Noto Sans KR 폰트를 로드하여 한글 렌더링.
 
 ```typescript
 import { ImageResponse } from "next/og";
-import { getTopicsByDate, getLatestTopics } from "@/lib/queries";
+import { getTopicsByDate, getLatestTopics, formatDateKR } from "@/lib/queries";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -741,18 +945,28 @@ export async function GET(request: Request) {
 
   const displayDate = date ?? new Date().toISOString().split("T")[0];
 
+  let fontData: ArrayBuffer | undefined;
+  try {
+    const res = await fetch(
+      "https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-kr@latest/korean-400-normal.ttf",
+    );
+    if (res.ok) fontData = await res.arrayBuffer();
+  } catch {
+    // 폰트 로드 실패 시 시스템 폰트로 폴백
+  }
+
   return new ImageResponse(
     (
       <div style={{
         width: "1200px", height: "630px",
         display: "flex", flexDirection: "column",
         padding: "60px", backgroundColor: "#fafaf9",
-        fontFamily: "sans-serif",
+        fontFamily: "Noto Sans KR",
       }}>
         <div style={{ fontSize: "28px", color: "#78716c" }}>
           {formatDateKR(displayDate)}
         </div>
-        <div style={{ fontSize: "48px", fontWeight: 700, marginTop: "12px" }}>
+        <div style={{ fontSize: "48px", fontWeight: 700, marginTop: "12px", color: "#1c1917" }}>
           오늘의 핫토픽
         </div>
         <div style={{
@@ -761,23 +975,29 @@ export async function GET(request: Request) {
         }}>
           {topics.slice(0, 5).map((t, i) => (
             <div key={i} style={{ fontSize: "28px", color: "#44403c" }}>
-              {i + 1}. {t.title}
+              {String(i + 1).padStart(2, "0")}. {t.title}
             </div>
           ))}
         </div>
       </div>
     ),
-    { width: 1200, height: 630 },
+    {
+      width: 1200, height: 630,
+      ...(fontData
+        ? { fonts: [{ name: "Noto Sans KR", data: fontData, style: "normal" as const, weight: 400 as const }] }
+        : {}),
+    },
   );
 }
 ```
 
-### 7-3. JSON-LD 구조화 데이터
+### 7-3. JSON-LD 구조화 데이터 (`src/components/JsonLd.tsx`)
 
 각 날짜 페이지에 `NewsArticle` 타입의 JSON-LD를 삽입한다.
 
 ```typescript
-// components/JsonLd.tsx
+import type { DailyTopic } from "@/lib/types";
+
 export function TopicJsonLd({ topic, date }: { topic: DailyTopic; date: string }) {
   const jsonLd = {
     "@context": "https://schema.org",
@@ -795,7 +1015,9 @@ export function TopicJsonLd({ topic, date }: { topic: DailyTopic; date: string }
   return (
     <script
       type="application/ld+json"
-      dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+      dangerouslySetInnerHTML={{
+        __html: JSON.stringify(jsonLd).replace(/</g, "\\u003c"),
+      }}
     />
   );
 }
@@ -803,31 +1025,31 @@ export function TopicJsonLd({ topic, date }: { topic: DailyTopic; date: string }
 
 메인/상세 페이지에서 토픽마다 `<TopicJsonLd />` 렌더링.
 
-### 7-4. sitemap.xml 자동 생성 (`app/sitemap.ts`)
+### 7-4. sitemap.xml 자동 생성 (`src/app/sitemap.ts`)
 
 ```typescript
-import { MetadataRoute } from "next";
+import type { MetadataRoute } from "next";
 import { supabase } from "@/lib/supabase";
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
-  // 토픽이 존재하는 모든 날짜 조회
   const { data } = await supabase
     .from("daily_topics")
     .select("date")
     .order("date", { ascending: false });
 
-  const uniqueDates = [...new Set(data?.map((d) => d.date) ?? [])];
+  const uniqueDates = [...new Set((data ?? []).map((d) => d.date))];
 
-  const datePages = uniqueDates.map((date) => ({
-    url: `https://<your-domain>/archive/${date}`,
-    lastModified: date,
-    changeFrequency: "never" as const,
-  }));
+  const baseUrl =
+    process.env.NEXT_PUBLIC_SITE_URL ?? "https://hot-topic-blog.vercel.app";
 
   return [
-    { url: "https://<your-domain>", lastModified: new Date(), changeFrequency: "daily" },
-    { url: "https://<your-domain>/archive", lastModified: new Date(), changeFrequency: "daily" },
-    ...datePages,
+    { url: baseUrl, lastModified: new Date(), changeFrequency: "daily" },
+    { url: `${baseUrl}/archive`, lastModified: new Date(), changeFrequency: "daily" },
+    ...uniqueDates.map((date) => ({
+      url: `${baseUrl}/archive/${date}`,
+      lastModified: new Date(date),
+      changeFrequency: "never" as const,
+    })),
   ];
 }
 ```
@@ -839,56 +1061,82 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
 ### 8-1. 레이아웃 컨셉
 
 ```
-┌─────────────────────────────────────────────┐
-│                                             │
-│    오늘의 핫토픽                              │
-│    2026년 3월 28일 토요일                     │
-│    AI가 매일 아침 선정하는 뉴스 브리핑          │
-│                                             │
-│    ─────────────────────────────────────     │
-│                                             │
-│    01                                       │
-│    경제  한국은행 기준금리 동결                 │
-│                                             │
-│    요약 텍스트 3~5줄. 객관적 뉴스 브리핑        │
-│    어조로 작성된 내용이 들어갑니다.              │
-│    핵심 수치나 인용이 포함될 수 있습니다.        │
-│                                             │
-│    출처  조선일보 · 한경 · 연합뉴스            │
-│                                             │
-│    ─────────────────────────────────────     │
-│                                             │
-│    02                                       │
-│    IT·테크  OpenAI, GPT-5 공개               │
-│    ...                                      │
-│                                             │
-│    ─────────────────────────────────────     │
-│                                             │
-│    ← 어제 핫토픽          아카이브 보기 →      │
-│                                             │
-└─────────────────────────────────────────────┘
++---------------------------------------------+
+|                                             |
+|    오늘의 핫토픽                              |
+|    2026년 3월 28일 토요일                     |
+|    AI가 매일 아침 선정하는 뉴스 브리핑          |
+|                                             |
+|    -----------------------------------------|
+|                                             |
+|    01                                       |
+|    경제  한국은행 기준금리 동결                 |
+|                                             |
+|    요약 텍스트 3~5줄. 객관적 뉴스 브리핑        |
+|    어조로 작성된 내용이 들어갑니다.              |
+|    핵심 수치나 인용이 포함될 수 있습니다.        |
+|                                             |
+|    출처  조선일보 · 한경 · 연합뉴스            |
+|                                             |
+|    -----------------------------------------|
+|                                             |
+|    02                                       |
+|    IT·테크  OpenAI, GPT-5 공개               |
+|    ...                                      |
+|                                             |
+|    -----------------------------------------|
+|                                             |
+|    <- 어제 핫토픽          아카이브 보기 ->     |
+|                                             |
++---------------------------------------------+
 ```
 
 ### 8-2. 스타일 원칙
 
 - **최대 너비**: 640px 중앙 정렬 (이메일 뉴스레터와 동일한 가독성)
-- **서체**: 시스템 세리프 또는 Noto Serif KR (본문), 산세리프 (카테고리 배지)
-- **색상**: 따뜻한 뉴트럴 계열 (stone/warm gray), 카테고리별 포인트 컬러
-- **구분선**: 얇은 수평선으로 토픽 사이 구분 (border-t)
+- **서체**: Noto Serif KR (본문, `--font-serif`), Geist Sans (UI, `--font-sans`), Geist Mono (코드, `--font-mono`)
+- **색상**: 따뜻한 뉴트럴 계열 (stone), 라이트(`#fafaf9`) / 다크(`#0c0a09`) 배경
+- **구분선**: 얇은 수평선으로 토픽 사이 구분 (border-stone-200)
 - **번호 표기**: 01~05 큰 숫자로 시각적 앵커
 - **여백**: 넉넉한 상하 패딩으로 콘텐츠 간 호흡
 - **반응형**: 모바일에서도 동일한 단일 컬럼 레이아웃
-- **다크모드**: Tailwind dark: prefix로 대응
+- **다크모드**: CSS `prefers-color-scheme` + Tailwind `dark:` prefix로 대응
 
-### 8-3. 카테고리 색상 매핑
+### 8-3. CSS 변수 (`src/app/globals.css`)
+
+```css
+@import "tailwindcss";
+
+:root {
+  --background: #fafaf9;
+  --foreground: #1c1917;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-serif: var(--font-noto-serif-kr);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0c0a09;
+    --foreground: #e7e5e4;
+  }
+}
+```
+
+### 8-4. 카테고리 색상 매핑
 
 ```typescript
-const categoryStyle: Record<string, string> = {
-  "정치":      "bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300",
-  "경제":      "bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300",
-  "사회":      "bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300",
-  "IT·과학":   "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300",
-  "IT·테크":   "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300",
+export const categoryStyles: Record<string, string> = {
+  정치: "bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300",
+  경제: "bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300",
+  사회: "bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300",
+  "IT·과학": "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300",
+  "IT·테크": "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300",
   "문화·스포츠": "bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300",
 };
 ```
@@ -903,8 +1151,9 @@ const categoryStyle: Record<string, string> = {
 e2e/
 ├── blog-home.spec.ts          # 메인 페이지
 ├── blog-archive.spec.ts       # 아카이브 페이지
-├── responsive.spec.ts         # 반응형 + 다크모드
-└── playwright.config.ts       # 설정
+└── responsive.spec.ts         # 반응형 + 다크모드
+
+playwright.config.ts           # 설정 (프로젝트 루트)
 ```
 
 파이프라인(Edge Function) 테스트는 Supabase 대시보드 + pipeline_logs 테이블에서 확인한다. Playwright는 프론트엔드 UI 테스트에만 집중한다.
@@ -912,7 +1161,7 @@ e2e/
 ### 9-2. Playwright 설정
 
 ```typescript
-// e2e/playwright.config.ts
+// playwright.config.ts
 import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
@@ -925,11 +1174,17 @@ export default defineConfig({
   projects: [
     {
       name: "desktop",
-      use: { browserName: "chromium", viewport: { width: 1280, height: 720 } },
+      use: {
+        browserName: "chromium",
+        viewport: { width: 1280, height: 720 },
+      },
     },
     {
       name: "mobile",
-      use: { browserName: "webkit", viewport: { width: 375, height: 812 } },
+      use: {
+        browserName: "webkit",
+        viewport: { width: 375, height: 812 },
+      },
     },
   ],
   webServer: {
@@ -1006,11 +1261,13 @@ test.describe("아카이브", () => {
     await expect(items.first()).toBeVisible();
   });
 
-  test("날짜 클릭 → 해당 날짜 페이지로 이동", async ({ page }) => {
+  test("날짜 클릭 -> 해당 날짜 페이지로 이동", async ({ page }) => {
     await page.goto("/archive");
     await page.locator("[data-testid='archive-date-item']").first().click();
     await expect(page).toHaveURL(/\/archive\/\d{4}-\d{2}-\d{2}/);
-    await expect(page.locator("[data-testid='topic-card']").first()).toBeVisible();
+    await expect(
+      page.locator("[data-testid='topic-card']").first(),
+    ).toBeVisible();
   });
 });
 ```
@@ -1094,12 +1351,15 @@ jobs:
 |---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase 프로젝트 URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase 공개 키 (읽기 전용) |
+| `NEXT_PUBLIC_SITE_URL` | 사이트 기본 URL (sitemap용, 선택) |
 
 ### Supabase Edge Function (Secrets)
 
 | 변수명 | 용도 |
 |---|---|
 | `ANTHROPIC_API_KEY` | Claude API 인증 |
+| `NAVER_CLIENT_ID` | Naver 뉴스 검색 API 클라이언트 ID |
+| `NAVER_CLIENT_SECRET` | Naver 뉴스 검색 API 클라이언트 시크릿 |
 
 > `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`는 Edge Function에서 자동 주입.
 
@@ -1108,25 +1368,27 @@ jobs:
 ## 11. 작업 순서
 
 ### Phase 1 — 파이프라인 구축
-1. Supabase MCP로 테이블, RLS, 함수 생성
-2. Edge Function 작성 (generate-topics)
-3. Claude 프롬프트 작성 및 테스트 (수동 호출)
-4. Zod 스키마 검증, 재시도 로직 확인
-5. pg_cron + pg_net 스케줄 등록
-6. 며칠간 자동 실행 모니터링 (pipeline_logs 확인)
+1. Supabase MCP로 테이블, RLS 생성
+2. Naver News API 연동 (naver.ts)
+3. 키워드 빈도 분석 로직 작성 (topics.ts)
+4. Claude 요약 프롬프트 작성 및 테스트 (prompts.ts)
+5. Edge Function 파이프라인 통합 (pipeline.ts)
+6. Zod 스키마 검증, 재시도 로직 확인
+7. pg_cron + pg_net 스케줄 등록
+8. 며칠간 자동 실행 모니터링 (pipeline_logs 확인)
 
 ### Phase 2 — 프론트엔드
-7. Next.js 프로젝트에 Supabase 연동
-8. 메인 페이지 (뉴스레터 스타일)
-9. 아카이브 페이지
-10. 반응형 + 다크모드
-11. SEO: 메타태그, OG 이미지, JSON-LD, sitemap.xml
+9. Next.js 프로젝트에 Supabase 연동
+10. 메인 페이지 (뉴스레터 스타일)
+11. 아카이브 페이지
+12. 반응형 + 다크모드
+13. SEO: 메타태그, OG 이미지, JSON-LD, sitemap.xml
 
 ### Phase 3 — 테스트 & 배포
-12. Playwright E2E 테스트 작성
-13. Vercel 배포 + 환경변수 설정
-14. GitHub Actions CI 파이프라인 설정
-15. 프롬프트 품질 튜닝
+14. Playwright E2E 테스트 작성
+15. Vercel 배포 + 환경변수 설정
+16. GitHub Actions CI 파이프라인 설정
+17. 프롬프트 품질 튜닝
 
 ### Phase 4 — 개선 (선택)
 - RSS 피드
@@ -1142,8 +1404,11 @@ jobs:
 |---|---|
 | Vercel Hobby | 무료 |
 | Supabase Free tier (500MB DB, Edge Functions 포함) | 무료 |
-| Claude API Sonnet (일 2회 호출 × 30일) | ~$3~8 |
-| **합계** | **~$3~8/월** |
+| Naver News API | 무료 (일 25,000건 제한) |
+| Claude API Sonnet (일 1회 호출 x 30일, ~2000 토큰/회) | ~$1 |
+| **합계** | **~$1/월** |
+
+> 이전 버전(Claude web_search 2회 호출)에서 **Naver API + 키워드 분석 + Claude 요약 1회**로 변경하여 비용을 대폭 절감.
 
 ---
 
@@ -1151,9 +1416,10 @@ jobs:
 
 | 리스크 | 대응 |
 |---|---|
-| Claude 웹 검색 결과 부실 | 재시도 3회 + 프롬프트에 구체적 소스 앵커 명시 |
-| Edge Function 400초 초과 | 토픽 선정/요약을 별도 Function으로 분리 |
-| 토픽 품질 불균일 | 프롬프트 반복 튜닝, 한국/글로벌 비율 조건 강화 |
-| 같은 토픽 연일 반복 | 전일 토픽을 프롬프트에 포함하여 제외 |
-| 출처 URL 깨짐 (404) | 향후 URL HEAD 요청 검증 추가 (P2) |
+| Naver API 응답 부실 / 할당량 초과 | 일 25,000건 제한 충분 (1,000건/회), 에러 시 pipeline_logs 기록 |
+| 키워드 분석 품질 불균일 | 불용어 사전 지속 보강, 최소 3기사 등장 조건으로 노이즈 필터링 |
+| Claude JSON 파싱 실패 | Zod 검증 + 최대 3회 재시도 (pipeline.ts) |
+| Edge Function 400초 초과 | Naver API 10회 순차 호출이 병목 — 필요 시 병렬화 |
+| 같은 토픽 연일 반복 | 키워드 빈도 분석이 당일 뉴스에 자연 집중, 필요 시 전일 키워드 제외 추가 |
+| 출처 URL 깨짐 (404) | Naver API가 제공하는 실제 기사 URL 사용으로 신뢰성 향상 |
 | pg_cron 실행 누락 | pipeline_logs 테이블에서 주기적 확인 |
