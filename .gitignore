@@ -26,6 +26,7 @@
 
 # claude code (local secrets)
 .claude/settings.local.json
+.mcp.json
 
 # debug
 npm-debug.log*
