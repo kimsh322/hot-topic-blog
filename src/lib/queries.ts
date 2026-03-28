@@ -64,6 +64,36 @@ export async function getArchiveDates(
   }
 }
 
+export async function getAdjacentDates(
+  date: string,
+): Promise<{ prev: string | null; next: string | null }> {
+  try {
+    const [prevResult, nextResult] = await Promise.all([
+      supabase
+        .from("daily_topics")
+        .select("date")
+        .lt("date", date)
+        .order("date", { ascending: false })
+        .limit(1)
+        .single(),
+      supabase
+        .from("daily_topics")
+        .select("date")
+        .gt("date", date)
+        .order("date", { ascending: true })
+        .limit(1)
+        .single(),
+    ]);
+
+    return {
+      prev: prevResult.data?.date ?? null,
+      next: nextResult.data?.date ?? null,
+    };
+  } catch {
+    return { prev: null, next: null };
+  }
+}
+
 export function formatDateKR(dateString: string): string {
   const date = new Date(dateString + "T00:00:00+09:00");
   return new Intl.DateTimeFormat("ko-KR", {

@@ -1,4 +1,4 @@
-import { getLatestTopics } from "@/lib/queries";
+import { getLatestTopics, getAdjacentDates } from "@/lib/queries";
 import { NewsletterHeader } from "@/components/NewsletterHeader";
 import { TopicCard } from "@/components/TopicCard";
 import { TopicJsonLd } from "@/components/JsonLd";
@@ -8,6 +8,9 @@ export const revalidate = 86400;
 
 export default async function Home() {
   const { topics, date } = await getLatestTopics();
+  const { prev, next } = date
+    ? await getAdjacentDates(date)
+    : { prev: null, next: null };
 
   return (
     <main className="mx-auto w-full max-w-[640px] px-4 py-12">
@@ -31,7 +34,7 @@ export default async function Home() {
         </div>
       )}
 
-      <DateNav currentDate={date} />
+      <DateNav prevDate={prev} nextDate={next} />
     </main>
   );
 }

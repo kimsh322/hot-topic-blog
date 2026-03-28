@@ -1,12 +1,22 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { getTopicsByDate, formatDateKR } from "@/lib/queries";
+import {
+  getTopicsByDate,
+  getAdjacentDates,
+  getArchiveDates,
+  formatDateKR,
+} from "@/lib/queries";
 import { NewsletterHeader } from "@/components/NewsletterHeader";
 import { TopicCard } from "@/components/TopicCard";
 import { TopicJsonLd } from "@/components/JsonLd";
 import { DateNav } from "@/components/DateNav";
 
 export const revalidate = 86400;
+
+export async function generateStaticParams() {
+  const { dates } = await getArchiveDates(1, 30);
+  return dates.map((date) => ({ date }));
+}
 
 export async function generateMetadata(props: {
   params: Promise<{ date: string }>;
@@ -30,7 +40,10 @@ export default async function DateDetailPage(props: {
   params: Promise<{ date: string }>;
 }) {
   const { date } = await props.params;
-  const topics = await getTopicsByDate(date);
+  const [topics, { prev, next }] = await Promise.all([
+    getTopicsByDate(date),
+    getAdjacentDates(date),
+  ]);
 
   return (
     <main className="mx-auto w-full max-w-[640px] px-4 py-12">
@@ -63,7 +76,7 @@ export default async function DateDetailPage(props: {
         </div>
       )}
 
-      <DateNav currentDate={date} />
+      <DateNav prevDate={prev} nextDate={next} />
     </main>
   );
 }
