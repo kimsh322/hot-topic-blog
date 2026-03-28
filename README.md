@@ -1,36 +1,71 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 오늘의 핫토픽 — AI 뉴스 브리핑
 
-## Getting Started
+매일 아침 네이버 뉴스 1000건을 분석하여 핫토픽 5개를 자동 선정하고, AI가 요약하는 뉴스레터 스타일 블로그.
 
-First, run the development server:
+**https://hot-topic-blog.vercel.app**
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## 작동 방식
+
+```
+매일 07:00 KST (pg_cron)
+    │
+    ▼
+네이버 뉴스 API × 10회 → 1000건 수집
+    │
+    ▼
+키워드 조합 빈도 분석 → 핫토픽 후보 10개
+    │
+    ▼
+Claude API → 카테고리 분산하여 5개 선정 + 한국어 요약
+    │
+    ▼
+Supabase DB 저장 → Next.js로 렌더링
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## 기술 스택
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+| 레이어 | 기술 |
+|---|---|
+| 프론트엔드 | Next.js 16.2.1 (App Router), Tailwind CSS 4, Noto Serif KR |
+| 백엔드 | Supabase Edge Function (Deno) |
+| DB | Supabase PostgreSQL |
+| 뉴스 수집 | 네이버 검색 API |
+| AI 요약 | Claude API (Sonnet, web_search 미사용) |
+| 스케줄러 | Supabase pg_cron + pg_net |
+| 배포 | Vercel Hobby (무료) |
+| 테스트 | Playwright E2E |
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## 로컬 개발
 
-## Learn More
+```bash
+pnpm install
+pnpm dev
+```
 
-To learn more about Next.js, take a look at the following resources:
+### 환경변수 (.env.local)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```
+NEXT_PUBLIC_SUPABASE_URL=https://xxx.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=xxx
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### E2E 테스트
 
-## Deploy on Vercel
+```bash
+pnpm exec playwright install
+pnpm exec playwright test
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## 프로젝트 구조
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```
+src/app/          페이지 (메인, 아카이브, OG 이미지, sitemap)
+src/components/   UI 컴포넌트 (TopicCard, CategoryBadge 등)
+src/lib/          Supabase 클라이언트, 쿼리, 타입
+supabase/         Edge Function (뉴스 수집 + 분석 + 요약)
+e2e/              Playwright E2E 테스트
+```
+
+## 월 비용
+
+~$1 (Claude API 요약 1회/일)
