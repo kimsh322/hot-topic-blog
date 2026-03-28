@@ -33,6 +33,9 @@ export async function generateMetadata(props: {
       description: topicTitles,
       images: [`/og?date=${date}`],
     },
+    alternates: {
+      canonical: `/archive/${date}`,
+    },
   };
 }
 

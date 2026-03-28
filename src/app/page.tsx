@@ -1,10 +1,30 @@
-import { getLatestTopics, getAdjacentDates } from "@/lib/queries";
+import type { Metadata } from "next";
+import {
+  getLatestTopics,
+  getAdjacentDates,
+  formatDateKR,
+} from "@/lib/queries";
 import { NewsletterHeader } from "@/components/NewsletterHeader";
 import { TopicCard } from "@/components/TopicCard";
 import { TopicJsonLd } from "@/components/JsonLd";
 import { DateNav } from "@/components/DateNav";
 
 export const revalidate = 86400;
+
+export async function generateMetadata(): Promise<Metadata> {
+  const { topics, date } = await getLatestTopics();
+  if (!date || topics.length === 0) return {};
+
+  const topicTitles = topics.map((t) => t.title).join(", ");
+  return {
+    description: `${formatDateKR(date)} 핫토픽: ${topicTitles}`,
+    openGraph: {
+      title: "오늘의 핫토픽 — AI 뉴스 브리핑",
+      description: topicTitles,
+      images: ["/og"],
+    },
+  };
+}
 
 export default async function Home() {
   const { topics, date } = await getLatestTopics();
