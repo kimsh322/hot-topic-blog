@@ -2,8 +2,8 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
-  baseURL: "http://localhost:3000",
   use: {
+    baseURL: "http://localhost:3296",
     trace: "on-first-retry",
     screenshot: "only-on-failure",
   },
@@ -24,8 +24,8 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "pnpm dev",
-    port: 3000,
+    command: "pnpm dev --port 3296",
+    port: 3296,
     reuseExistingServer: !process.env.CI,
   },
 });
