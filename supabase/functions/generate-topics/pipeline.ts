@@ -86,7 +86,10 @@ export async function runPipeline(
     }));
     await supabase.from("daily_topics").insert(rows);
 
-    // 5. 로그 기록
+    // 5. Vercel 캐시 갱신
+    await revalidateVercel();
+
+    // 6. 로그 기록
     const status = articles.length >= 5 ? "success" : "partial";
     await logPipeline(supabase, {
       date: today, status, topicsCount: articles.length,
@@ -107,6 +110,21 @@ export async function runPipeline(
       status: "failed", topicsCount: 0, retryCount,
       durationMs: Date.now() - startTime, error: errorMsg,
     };
+  }
+}
+
+async function revalidateVercel() {
+  const siteUrl = Deno.env.get("SITE_URL");
+  const secret = Deno.env.get("REVALIDATE_SECRET");
+  if (!siteUrl || !secret) return;
+
+  try {
+    await fetch(`${siteUrl}/api/revalidate`, {
+      method: "POST",
+      headers: { "x-revalidate-secret": secret },
+    });
+  } catch {
+    // revalidation 실패해도 파이프라인은 성공으로 처리
   }
 }
 
