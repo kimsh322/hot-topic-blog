@@ -125,7 +125,15 @@ async function revalidateVercel() {
     });
   } catch {
     // revalidation 실패해도 파이프라인은 성공으로 처리
+    return;
   }
+
+  // 캐시 워밍: 첫 방문자가 cold render 부담을 지지 않도록
+  // 메인/아카이브를 백그라운드에서 한 번 fetch
+  await Promise.allSettled([
+    fetch(siteUrl, { headers: { "x-cache-warm": "1" } }),
+    fetch(`${siteUrl}/archive`, { headers: { "x-cache-warm": "1" } }),
+  ]);
 }
 
 async function logPipeline(
