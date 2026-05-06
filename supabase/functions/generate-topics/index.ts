@@ -4,9 +4,10 @@ import { runPipeline } from "./pipeline.ts";
 
 serve(async (req: Request) => {
   const authHeader = req.headers.get("Authorization");
+  const cronSecret = Deno.env.get("CRON_SECRET");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
-  if (authHeader !== `Bearer ${serviceRoleKey}`) {
+  if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
     return new Response("Unauthorized", { status: 401 });
   }
 
